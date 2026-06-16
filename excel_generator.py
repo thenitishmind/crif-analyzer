@@ -455,8 +455,6 @@ def generate_excel_report(data: dict, ai_result: dict = None) -> bytes:
     active_analysis = [
         ('Total Active Loans', len(active_loans)),
         ('Total Outstanding Balance', f"Rs. {int(active_balance):,}" if active_balance > 0 else "Rs. 0"),
-        ('Total Credit Limit/Sanctioned', f"Rs. {int(active_limit):,}" if active_limit > 0 else "Rs. 0"),
-        ('Credit Utilization %', f"{(active_balance/active_limit*100):.2f}%" if active_limit > 0 else "0%"),
         ('Total Overdue Amount', f"Rs. {int(active_overdue):,}" if active_overdue > 0 else "Rs. 0"),
         ('Total Monthly EMI', f"Rs. {int(active_emi):,}" if active_emi > 0 else "Rs. 0"),
         ('Average Account Age', avg_age_str),
