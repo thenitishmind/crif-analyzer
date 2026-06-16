@@ -147,6 +147,46 @@ def bdr(ws, r1, r2, c1, c2):
         for c in row:
             c.border = thin_border()
 
+# Loan repayment-track classification helpers
+_NPA_ASSET_KEYWORDS = ("sub-standard", "substandard", "sub standard", "doubtful", "loss", "npa")
+_NPA_CODES   = {"SUB", "DBT", "LSS", "NPA", "SS", "D1", "D2", "D3"}
+_SMA_CODES   = {"SMA", "SMA0", "SMA1", "SMA2"}
+_CLEAN_CODES = {"STD", "000", "00", "0"}
+_MISSING_TOKENS = {"-", "NA", "N/A", "?", "*", ""}
+
+def classify_loan_track(acct):
+    """Categorise a loan's repayment track as one of 'NPA', 'Late', 'Clean'
+    or 'Missing', based on its DPD/payment-history string and asset
+    classification. 'Clean' means a fully-tracked, on-time account."""
+    asset = str(acct.get("Asset Classification", "")).lower()
+    dpd_raw = str(acct.get("DPD History / Payment History", "")).strip()
+    tokens = [t.strip().upper() for t in re.split(r"[\/\s,|]+", dpd_raw) if t.strip()]
+
+    max_dpd = 0
+    has_clean = has_npa = has_sma = False
+    for t in tokens:
+        if set(t) <= {"X"} or t in _MISSING_TOKENS:
+            continue  # missing / not-reported month
+        elif t in _NPA_CODES:
+            has_npa = True
+        elif t in _SMA_CODES:
+            has_sma = True
+        elif t in _CLEAN_CODES:
+            has_clean = True
+        elif t.isdigit():
+            v = int(t)
+            max_dpd = max(max_dpd, v)
+            if v == 0:
+                has_clean = True
+
+    if has_npa or max_dpd >= 90 or any(k in asset for k in _NPA_ASSET_KEYWORDS):
+        return "NPA"
+    if max_dpd > 0 or has_sma:
+        return "Late"
+    if has_clean:
+        return "Clean"
+    return "Missing"
+
 def generate_excel_report(data: dict, ai_result: dict = None) -> bytes:
     """Generates the structured Excel sheet to match user shared analysis."""
     wb = openpyxl.Workbook()
@@ -535,7 +575,56 @@ def generate_excel_report(data: dict, ai_result: dict = None) -> bytes:
         status_bg = GREEN_BG if status_txt in ['Excellent', 'Healthy'] else ORANGE_BG if status_txt in ['Moderate', 'Good'] else RED_BG if status_txt in ['Needs Attention', 'High'] else None
         val(ws3[f'F{r}'], status_txt, center=True, bg=status_bg, bold=True)
     bdr(ws3, 20, 20 + len(health_indicators), 1, 7)
-    
+
+    # Section 4: Loan Repayment Track Report (Active + Closed)
+    ws3.merge_cells('A26:G26')
+    hdr(ws3['A26'], 'LOAN REPAYMENT TRACK REPORT  (ACTIVE + CLOSED)', bg=MED_BLUE)
+    ws3.row_dimensions[26].height = 22
+
+    ws3.merge_cells('A27:B27'); hdr(ws3['A27'], 'Track Category', size=10)
+    ws3.merge_cells('C27:D27'); hdr(ws3['C27'], 'Active Loans', size=10)
+    ws3.merge_cells('E27:F27'); hdr(ws3['E27'], 'Closed Loans', size=10)
+    hdr(ws3['G27'], 'Total', size=10)
+    ws3.row_dimensions[27].height = 20
+
+    track_categories = [
+        ('On-Time / Fully Tracked',     'Clean',   GREEN_BG),
+        ('Late / Delinquent (DPD > 0)', 'Late',    ORANGE_BG),
+        ('NPA / Sub-Standard',          'NPA',     RED_BG),
+        ('Missing / Not Reported',      'Missing', LIGHT_GRAY),
+    ]
+    active_track, closed_track = {}, {}
+    for a in active_loans:
+        cat = classify_loan_track(a)
+        active_track[cat] = active_track.get(cat, 0) + 1
+    for a in closed_loans:
+        cat = classify_loan_track(a)
+        closed_track[cat] = closed_track.get(cat, 0) + 1
+
+    for idx, (label_txt, key, row_bg) in enumerate(track_categories):
+        r = 28 + idx
+        ws3.row_dimensions[r].height = 18
+        a_cnt = active_track.get(key, 0)
+        c_cnt = closed_track.get(key, 0)
+        ws3.merge_cells(f'A{r}:B{r}')
+        lbl(ws3[f'A{r}'], label_txt)
+        ws3.merge_cells(f'C{r}:D{r}')
+        val(ws3[f'C{r}'], a_cnt, center=True, bold=a_cnt > 0, bg=row_bg if a_cnt else None)
+        ws3.merge_cells(f'E{r}:F{r}')
+        val(ws3[f'E{r}'], c_cnt, center=True, bold=c_cnt > 0, bg=row_bg if c_cnt else None)
+        val(ws3[f'G{r}'], a_cnt + c_cnt, center=True, bold=True)
+
+    rt = 28 + len(track_categories)
+    ws3.row_dimensions[rt].height = 18
+    ws3.merge_cells(f'A{rt}:B{rt}')
+    lbl(ws3[f'A{rt}'], 'Total Loans Tracked')
+    ws3.merge_cells(f'C{rt}:D{rt}')
+    val(ws3[f'C{rt}'], len(active_loans), center=True, bold=True)
+    ws3.merge_cells(f'E{rt}:F{rt}')
+    val(ws3[f'E{rt}'], len(closed_loans), center=True, bold=True)
+    val(ws3[f'G{rt}'], len(active_loans) + len(closed_loans), center=True, bold=True)
+    bdr(ws3, 26, rt, 1, 7)
+
     for col, w in zip(['A','B','C','D','E','F','G'], [20, 20, 20, 20, 14, 16, 16]):
         ws3.column_dimensions[col].width = w
 
