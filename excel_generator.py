@@ -155,9 +155,11 @@ _CLEAN_CODES = {"STD", "000", "00", "0"}
 _MISSING_TOKENS = {"-", "NA", "N/A", "?", "*", ""}
 
 def classify_loan_track(acct):
-    """Categorise a loan's repayment track as one of 'NPA', 'Late', 'Clean'
-    or 'Missing', based on its DPD/payment-history string and asset
-    classification. 'Clean' means a fully-tracked, on-time account."""
+    """Categorise a loan's repayment track. Returns a (category, max_dpd)
+    tuple where category is one of 'NPA', 'Late', 'Clean' or 'Missing',
+    derived from the DPD/payment-history string and asset classification.
+    'Clean' means a fully-tracked, on-time account; max_dpd is the worst
+    days-past-due seen in the history (0 if none/unknown)."""
     asset = str(acct.get("Asset Classification", "")).lower()
     dpd_raw = str(acct.get("DPD History / Payment History", "")).strip()
     tokens = [t.strip().upper() for t in re.split(r"[\/\s,|]+", dpd_raw) if t.strip()]
@@ -180,12 +182,12 @@ def classify_loan_track(acct):
                 has_clean = True
 
     if has_npa or max_dpd >= 90 or any(k in asset for k in _NPA_ASSET_KEYWORDS):
-        return "NPA"
+        return "NPA", max_dpd
     if max_dpd > 0 or has_sma:
-        return "Late"
+        return "Late", max_dpd
     if has_clean:
-        return "Clean"
-    return "Missing"
+        return "Clean", max_dpd
+    return "Missing", max_dpd
 
 def generate_excel_report(data: dict, ai_result: dict = None) -> bytes:
     """Generates the structured Excel sheet to match user shared analysis."""
@@ -595,10 +597,10 @@ def generate_excel_report(data: dict, ai_result: dict = None) -> bytes:
     ]
     active_track, closed_track = {}, {}
     for a in active_loans:
-        cat = classify_loan_track(a)
+        cat, _ = classify_loan_track(a)
         active_track[cat] = active_track.get(cat, 0) + 1
     for a in closed_loans:
-        cat = classify_loan_track(a)
+        cat, _ = classify_loan_track(a)
         closed_track[cat] = closed_track.get(cat, 0) + 1
 
     for idx, (label_txt, key, row_bg) in enumerate(track_categories):
@@ -627,6 +629,91 @@ def generate_excel_report(data: dict, ai_result: dict = None) -> bytes:
 
     for col, w in zip(['A','B','C','D','E','F','G'], [20, 20, 20, 20, 14, 16, 16]):
         ws3.column_dimensions[col].width = w
+
+    # -------------------------------------------------------------------------
+    # SHEET — Loan Track Report (per-loan repayment track: Active + Closed)
+    # -------------------------------------------------------------------------
+    wst = wb.create_sheet('Loan Track Report')
+    wst.sheet_view.showGridLines = False
+    wst.freeze_panes = 'A3'
+
+    wst.merge_cells('A1:L1')
+    hdr(wst['A1'], f'LOAN REPAYMENT TRACK REPORT  ({len(accounts)} Loans — Active + Closed)', size=13, bg=MED_BLUE)
+    wst.row_dimensions[1].height = 32
+
+    track_headers = [
+        '#', 'Lender Name', 'Account Number', 'Account Type', 'Status',
+        'Track Status', 'Worst DPD (Days)', 'Monthly EMI', 'Overdue Amount',
+        'Current Balance', 'Asset Classification', 'DPD / Payment History'
+    ]
+    for j, h in enumerate(track_headers):
+        hdr(wst.cell(2, j + 1), h, size=9)
+    wst.row_dimensions[2].height = 28
+
+    track_label = {'Clean': 'On-Time / Fully Tracked', 'Late': 'Late / Delinquent',
+                   'NPA': 'NPA / Sub-Standard', 'Missing': 'Missing / Not Reported'}
+    track_color = {'Clean': GREEN_BG, 'Late': ORANGE_BG, 'NPA': RED_BG, 'Missing': LIGHT_GRAY}
+
+    for i, acct in enumerate(accounts):
+        rn = i + 3
+        wst.row_dimensions[rn].height = 22
+        cat, max_dpd = classify_loan_track(acct)
+        row_fill = track_color[cat]
+
+        emi_val = safe_num(acct.get("Installment Amount", 0))
+        overdue_val = safe_num(acct.get("Overdue Amount", 0))
+        balance_val = safe_num(acct.get("Current Balance", 0))
+
+        row_vals = [
+            i + 1,
+            acct.get("Lender", "-"),
+            acct.get("Account Number", "-"),
+            acct.get("Account Type", "-"),
+            acct.get("Status", "-"),
+            track_label[cat],
+            max_dpd if max_dpd > 0 else "-",
+            emi_val,
+            overdue_val,
+            balance_val,
+            acct.get("Asset Classification", "-"),
+            acct.get("DPD History / Payment History", "-"),
+        ]
+        for j, v in enumerate(row_vals):
+            c = wst.cell(rn, j + 1)
+            c.value = safe(v) if not isinstance(v, (int, float)) else v
+            c.font = Font(name='Arial', size=9, bold=(j == 5))
+            c.fill = PatternFill('solid', start_color=row_fill)
+            c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            c.border = thin_border()
+            if j in (7, 8, 9) and isinstance(v, (int, float)) and v > 0:
+                c.number_format = '₹#,##,##0.00'
+                c.alignment = Alignment(horizontal='right', vertical='center')
+
+    for col_idx, w in enumerate([4, 20, 16, 16, 12, 20, 13, 14, 14, 14, 18, 26]):
+        wst.column_dimensions[get_column_letter(col_idx + 1)].width = w
+
+    lg_row = len(accounts) + 4
+    wst.merge_cells(f'A{lg_row}:L{lg_row}')
+    hdr(wst[f'A{lg_row}'], 'TRACK STATUS LEGEND', bg=MED_BLUE, size=9)
+    wst.row_dimensions[lg_row].height = 20
+    track_legend = [
+        (GREEN_BG,   'On-Time / Fully Tracked — all reported months paid on time'),
+        (ORANGE_BG,  'Late / Delinquent — one or more months past due (DPD > 0 or SMA)'),
+        (RED_BG,     'NPA / Sub-Standard — 90+ days past due or NPA asset classification'),
+        (LIGHT_GRAY, 'Missing / Not Reported — no payment history available'),
+    ]
+    for li, (bg, desc) in enumerate(track_legend):
+        rr = lg_row + 1 + li
+        wst.row_dimensions[rr].height = 18
+        wst.cell(rr, 1).fill = PatternFill('solid', start_color=bg)
+        wst.cell(rr, 1).border = thin_border()
+        wst.merge_cells(f'B{rr}:L{rr}')
+        c = wst.cell(rr, 2)
+        c.value = desc
+        c.font = Font(name='Arial', size=9)
+        c.alignment = Alignment(vertical='center')
+        for col_idx in range(2, 13):
+            wst.cell(rr, col_idx).border = thin_border()
 
     # -------------------------------------------------------------------------
     # SHEET 4 — Active Loans Detailed
@@ -1013,6 +1100,12 @@ def generate_excel_report(data: dict, ai_result: dict = None) -> bytes:
         # Auto-widths for raw sheet
         for col_idx in range(len(all_keys)):
             ws8.column_dimensions[get_column_letter(col_idx + 1)].width = 18
+
+    # -------------------------------------------------------------------------
+    # Place the Loan Track Report right after the Dashboard sheet (index 2)
+    # -------------------------------------------------------------------------
+    wb._sheets.remove(wst)
+    wb._sheets.insert(2, wst)
 
     # -------------------------------------------------------------------------
     # Number every sheet tab serially: '1. ', '2. ', … (pages in serial order)
